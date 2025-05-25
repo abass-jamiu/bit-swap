@@ -108,3 +108,99 @@
   }
   { shares: uint }
 )
+
+;; Fee accumulation tracking
+(define-map accumulated-fees
+  principal
+  uint
+)
+
+;; CORE ALGORITHMIC FUNCTIONS
+
+;; Calculate output amount using constant product formula with fees
+(define-private (calculate-output-amount
+    (input-amount uint)
+    (input-reserve uint)
+    (output-reserve uint)
+  )
+  (let (
+      (input-with-fee (mul input-amount (- PRECISION (var-get protocol-fee-rate))))
+      (numerator (mul input-with-fee output-reserve))
+      (denominator (+ (mul input-reserve PRECISION) input-with-fee))
+    )
+    (/ numerator denominator)
+  )
+)
+
+;; Mint liquidity pool tokens for providers
+(define-private (mint-pool-tokens
+    (pool-id uint)
+    (amount-x uint)
+    (amount-y uint)
+    (recipient principal)
+  )
+  (let (
+      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+      (total-shares (get total-shares pool))
+      (shares-to-mint (if (is-eq total-shares u0)
+        ;; Initial liquidity: geometric mean
+        (mul amount-x amount-y)
+        ;; Subsequent liquidity: proportional to existing reserves
+        (min (/ (mul amount-x total-shares) (get reserve-x pool))
+          (/ (mul amount-y total-shares) (get reserve-y pool))
+        )
+      ))
+    )
+    ;; Update pool state
+    (map-set pools pool-id
+      (merge pool {
+        reserve-x: (+ (get reserve-x pool) amount-x),
+        reserve-y: (+ (get reserve-y pool) amount-y),
+        total-shares: (+ total-shares shares-to-mint),
+      })
+    )
+    ;; Update provider shares
+    (map-set liquidity-providers {
+      pool-id: pool-id,
+      provider: recipient,
+    } { shares: (+
+      (default-to u0
+        (get shares
+          (map-get? liquidity-providers {
+            pool-id: pool-id,
+            provider: recipient,
+          })
+        ))
+      shares-to-mint
+    ) }
+    )
+    (ok shares-to-mint)
+  )
+)
+
+;; PUBLIC INTERFACE FUNCTIONS
+
+;; Create a new trading pool (Owner only)
+(define-public (create-pool
+    (token-x <ft-trait>)
+    (token-y <ft-trait>)
+  )
+  (let (
+      (pool-id (var-get total-pools))
+      (token-x-principal (contract-of token-x))
+      (token-y-principal (contract-of token-y))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq token-x-principal token-y-principal)) ERR-INVALID-POOL)
+    (map-set pools pool-id {
+      token-x: token-x-principal,
+      token-y: token-y-principal,
+      reserve-x: u0,
+      reserve-y: u0,
+      total-shares: u0,
+      active: true,
+    })
+    (var-set total-pools (+ pool-id u1))
+    (ok pool-id)
+  )
+)
