@@ -307,3 +307,125 @@
     )
   )
 )
+
+;; Remove liquidity from pool
+(define-public (remove-liquidity
+    (pool-id uint)
+    (token-x <ft-trait>)
+    (token-y <ft-trait>)
+    (shares uint)
+    (min-amount-x uint)
+    (min-amount-y uint)
+  )
+  (let (
+      (pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND))
+      (token-x-principal (contract-of token-x))
+      (token-y-principal (contract-of token-y))
+      (provider-shares (unwrap!
+        (get shares
+          (map-get? liquidity-providers {
+            pool-id: pool-id,
+            provider: tx-sender,
+          })
+        )
+        ERR-INSUFFICIENT-BALANCE
+      ))
+      (total-shares (get total-shares pool))
+    )
+    ;; Validation checks
+    (asserts! (>= provider-shares shares) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (> shares u0) ERR-INVALID-AMOUNT)
+    (asserts! (is-eq token-x-principal (get token-x pool)) ERR-INVALID-POOL)
+    (asserts! (is-eq token-y-principal (get token-y pool)) ERR-INVALID-POOL)
+    (let (
+        (amount-x (/ (mul shares (get reserve-x pool)) total-shares))
+        (amount-y (/ (mul shares (get reserve-y pool)) total-shares))
+      )
+      ;; Slippage protection
+      (asserts! (>= amount-x min-amount-x) ERR-SLIPPAGE-TOO-HIGH)
+      (asserts! (>= amount-y min-amount-y) ERR-SLIPPAGE-TOO-HIGH)
+      ;; Update provider shares
+      (map-set liquidity-providers {
+        pool-id: pool-id,
+        provider: tx-sender,
+      } { shares: (- provider-shares shares) }
+      )
+      ;; Update pool state
+      (map-set pools pool-id
+        (merge pool {
+          reserve-x: (- (get reserve-x pool) amount-x),
+          reserve-y: (- (get reserve-y pool) amount-y),
+          total-shares: (- total-shares shares),
+        })
+      )
+      ;; Transfer tokens back to provider
+      (as-contract (begin
+        (try! (contract-call? token-x transfer amount-x (as-contract tx-sender)
+          tx-sender
+        ))
+        (try! (contract-call? token-y transfer amount-y (as-contract tx-sender)
+          tx-sender
+        ))
+        (ok {
+          amount-x: amount-x,
+          amount-y: amount-y,
+        })
+      ))
+    )
+  )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Get comprehensive pool information
+(define-read-only (get-pool-info (pool-id uint))
+  (map-get? pools pool-id)
+)
+
+;; Get liquidity provider share information
+(define-read-only (get-provider-shares
+    (pool-id uint)
+    (provider principal)
+  )
+  (map-get? liquidity-providers {
+    pool-id: pool-id,
+    provider: provider,
+  })
+)
+
+;; Calculate current exchange rate between pool tokens
+(define-read-only (get-exchange-rate (pool-id uint))
+  (let ((pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND)))
+    (ok (/ (mul (get reserve-y pool) PRECISION) (get reserve-x pool)))
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Update protocol fee rate (Owner only)
+(define-public (set-protocol-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (<= new-fee PRECISION) ERR-INVALID-AMOUNT)
+    (var-set protocol-fee-rate new-fee)
+    (ok true)
+  )
+)
+
+;; Pause trading on a specific pool (Owner only)
+(define-public (pause-pool (pool-id uint))
+  (let ((pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (get active pool) ERR-POOL-NOT-FOUND)
+    (ok (map-set pools pool-id (merge pool { active: false })))
+  )
+)
+
+;; Resume trading on a paused pool (Owner only)
+(define-public (resume-pool (pool-id uint))
+  (let ((pool (unwrap! (map-get? pools pool-id) ERR-POOL-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get active pool)) ERR-POOL-NOT-FOUND)
+    (ok (map-set pools pool-id (merge pool { active: true })))
+  )
+)
